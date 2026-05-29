@@ -45,6 +45,9 @@ export function getEnvVarName(provider: string): string | undefined {
 /** Check which providers have API keys configured (env vars only) */
 export function getAvailableProviders(): string[] {
   const providers = Object.keys(ENV_MAP).filter((p) => getApiKey(p))
+  if (process.env.XF_API_KEY && process.env.XF_BASE_URL) {
+    providers.push('xunfei')
+  }
   if (process.env.OPENAI_COMPATIBLE_API_KEY && process.env.OPENAI_COMPATIBLE_BASE_URL) {
     providers.push('custom')
   }
@@ -155,6 +158,10 @@ export function getProviderOptions() {
     alibaba: getApiKey('alibaba'),
     zhipu: getApiKey('zhipu'),
     moonshotai: getApiKey('moonshotai'),
+    xunfei: {
+      apiKey: process.env.XF_API_KEY,
+      baseURL: process.env.XF_BASE_URL,
+    },
     custom: {
       apiKey: process.env.OPENAI_COMPATIBLE_API_KEY,
       baseURL: process.env.OPENAI_COMPATIBLE_BASE_URL,

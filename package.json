@@ -1,4 +1,5 @@
 {
+  "name": "x-code-cli",
   "private": true,
   "type": "module",
   "packageManager": "pnpm@10.7.1",

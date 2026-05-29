@@ -58,6 +58,8 @@ const MODEL_CONTEXT_WINDOWS: ReadonlyMap<string, number> = new Map([
   ['zhipu:glm-4-plus', 128000],
   // Moonshot
   ['moonshotai:kimi-k2.5', 131072],
+  // iFlytek (讯飞)
+  ['xunfei:astron-code-latest', 128000],
 ])
 
 /** Provider-level fallback context windows. */
@@ -70,6 +72,7 @@ const PROVIDER_CONTEXT_WINDOWS: ReadonlyMap<string, number> = new Map([
   ['xai', 128000],
   ['zhipu', 128000],
   ['moonshotai', 128000],
+  ['xunfei', 128000],
 ])
 
 /** Resolve context window (tokens) for a model id like `provider:model`. */

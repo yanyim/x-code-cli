@@ -32,6 +32,16 @@ export function createModelRegistry() {
   if (opts.zhipu) providers.zhipu = zhipu
   if (opts.moonshotai) providers.moonshotai = createMoonshotAI({ fetch: permanentErrorFetch })
 
+  // iFlytek (讯飞星火) — OpenAI-compatible MaaS endpoint
+  if (opts.xunfei.apiKey && opts.xunfei.baseURL) {
+    providers.xunfei = createOpenAICompatible({
+      name: 'xunfei',
+      apiKey: opts.xunfei.apiKey,
+      baseURL: opts.xunfei.baseURL,
+      fetch: permanentErrorFetch,
+    })
+  }
+
   // Custom OpenAI compatible provider
   if (opts.custom.apiKey && opts.custom.baseURL) {
     providers.custom = createOpenAICompatible({

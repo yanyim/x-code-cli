@@ -29,6 +29,7 @@ const CAPS: Record<string, ProviderCapabilities> = {
   alibaba: { image: true, pdf: true, filesApi: true },
   zhipu: { image: true, pdf: true, filesApi: true },
   deepseek: { image: false, pdf: false, filesApi: false },
+  xunfei: { image: false, pdf: false, filesApi: false },
   // Custom OpenAI-compatible endpoints are conservative-by-default —
   // users who know their endpoint supports vision can override via env
   // (X_CODE_CUSTOM_SUPPORTS_IMAGE=1) if we ever add that.

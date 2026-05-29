@@ -21,6 +21,11 @@ pnpm test               # vitest run, all packages
 pnpm test <pattern>     # single test file or directory:
                         #   pnpm test packages/core/tests/agent-loop.test.ts
                         #   pnpm test packages/core/tests/agent
+pnpm test:e2e           # e2e scenarios (spawns xc -p in isolated tmpdirs)
+                        #   pnpm test:e2e                          # all
+                        #   pnpm test:e2e --filter edit            # substring match
+                        #   pnpm test:e2e --resume                 # re-run failures
+                        #   pnpm test:e2e --model deepseek         # specific model
 pnpm ci                 # typecheck + lint + test + build (mirror CI)
 pnpm release            # bump version + tag + publish (scripts/release.mjs); maintainers only
 ```
@@ -77,6 +82,25 @@ agentLoop()
 
 **`systemPromptCache` must remain byte-stable for the entire session.** OpenAI-compatible providers (DeepSeek / Moonshot / Alibaba / Zhipu / xAI) auto-cache stable prefixes, and `buildSystemPrompt` is called only on the first turn. Any change that interpolates per-turn data (timestamps, frame-shifting context) into the system prompt silently disables prompt caching for those providers.
 
+### Tools
+
+13 built-in tools registered in `core/src/tools/index.ts`: `readFile`, `writeFile`, `edit`, `shell`, `glob`, `grep`, `listDir`, `webSearch`, `webFetch`, `askUser`, `enterPlanMode`, `exitPlanMode`, `todoWrite`. The `activateSkill` tool is injected conditionally when skills exist.
+
+Tool output is truncated (`truncate.ts`) at a dual budget — 2000 lines **or** 50 KB, whichever hits first — with a 80/20 head-tail split for file reads and head-only for shell output. This means large tool results are silently trimmed; when debugging missing context, check truncation.
+
+`progress.ts` provides a side-channel registry keyed by `toolCallId` so tools can report progress mid-execution without threading callbacks through the AI SDK's `tool()` definition.
+
+Shell execution goes through `shell-provider.ts` (cross-platform: bash/zsh on POSIX, PowerShell on Windows, 20 MB max buffer). Shell commands are classified by `shell-utils.ts`: compound commands split on `|`, `&&`, `;`, `||`, each sub-command classified as read-only (auto-allow), destructive (deny), or other (ask).
+
+### Permissions
+
+Three levels: `always-allow`, `ask`, `deny`. Read tools default to `always-allow`; write tools to `ask`; shell uses dynamic classification (see Tools above).
+
+- **`acceptEdits` mode**: auto-allows `writeFile` and `edit` only if the target path is inside the project directory and is not a sensitive dotfile (`.bashrc`, `.ssh/`, `.env`, `.git/`, `.vscode/`, `.idea/`, etc.).
+- **`plan` mode**: purely prompt-based (system prompt overlay tells the model not to write), no permission-layer change.
+- **Session allow rules**: when the user picks "always" in a permission dialog, a rule is persisted to disk and reloaded on next session. Compound shell commands generate multiple rules.
+- **Shell permission caching**: LRU cache (256 entries) for resolved shell permission levels.
+
 ### Sub-agents
 
 The `task` tool delegates a sub-task to a specialized sub-agent that runs in isolated context — only the sub-agent's final assistant message is returned to the parent. Implementation lives in `core/src/agent/sub-agents/`:
@@ -115,6 +139,8 @@ When changing tool execution code, **always thread `options.abortSignal` through
 
 The AGENTS.md chain lets monorepo subpackages override repo-root guidance — leaf wins. `~/.x-code` is overridable via the `X_CODE_HOME` env var (used by tests).
 
+**Auto-memory extraction** (`core/src/agent/memory-extractor.ts`): after each turn that ends with `finishReason === 'stop'`, a fire-and-forget `generateText` call scans the transcript for facts worth persisting (user preferences, corrections, project state, external resource pointers). Constraints: max 3 writes per pass, min 4 messages in transcript before extraction triggers. Memory writes are NOT a tool — they happen silently outside the tool system.
+
 ### Provider configuration
 
 API keys are read **only** from environment variables (never persisted to disk). Mapping lives in `core/src/config/index.ts:ENV_MAP`:
@@ -129,6 +155,48 @@ alibaba     ALIBABA_API_KEY                zhipu       ZHIPU_API_KEY
 Plus the OpenAI-compatible escape hatch: `OPENAI_COMPATIBLE_API_KEY` + `OPENAI_COMPATIBLE_BASE_URL` (registered as the `custom` provider).
 
 When adding a provider, also update `packages/core/tests/config.test.ts:PROVIDER_ENV_VARS` — the test cleanup helper enumerates every key explicitly so a developer running tests with one provider key live in their shell doesn't leak it into "no provider configured" assertions.
+
+**Per-provider specifics** (in `core/src/providers/`):
+
+- **Capabilities table** (`capabilities.ts`): per-provider multimodal support (image/PDF/filesApi). DeepSeek and `custom` lack vision; the file-ingest pipeline uses this to decide inline vs. OCR. Drives `provider-compat.ts` (strips unsupported content parts) and `vision-fallback.ts` (falls back to tesseract.js OCR when the provider doesn't support images).
+- **Thinking toggle** (`thinking.ts`): `/thinking on|off` maps to different parameters per provider — Anthropic uses `budgetTokens`, DeepSeek/Moonshot use `thinking.type`, Alibaba uses `enableThinking`, Google uses `thinkingBudget`, xAI/OpenAI use `reasoningEffort`. Zhipu and `custom` are no-ops.
+- **Permanent error handling** (`registry.ts`): `permanentErrorFetch` wrapper rewrites retryable-but-actually-permanent HTTP errors (billing exhaustion, context overflow, content filter, invalid key, model not found) to non-retryable status codes — without this the AI SDK's retry logic burns ~30 seconds on each failure.
+
+### Skills
+
+File-based reusable workflows discovered from `~/.x-code/skills/*/SKILL.md` (user) and `<repo-root>/.x-code/skills/*/SKILL.md` (project). Each skill is YAML frontmatter (`name`, `description`) + markdown body. Project-level overrides plugin-level overrides user-level on name collisions.
+
+The `activateSkill` tool is injected conditionally when `SkillRegistry` is non-empty. The model self-selects a skill based on description; the tool returns the markdown body wrapped in `<activated_skill>` XML tags. Up to 50 bundled files can be listed per skill. The registry is built once at startup and frozen for the session — `/skill refresh` rebuilds in-place and invalidates `systemPromptCache`.
+
+### MCP
+
+Two transports: stdio (local subprocess) and streamable HTTP (remote). Three-tier config merge: user (`~/.x-code/config.json`) → plugin-contributed → project (`.x-code/config.json`). Project-level requires a trust consent dialog on first use; trust is persisted.
+
+MCP tools get callable names in `<server>__<tool>` format (collisions resolved with hash suffixes). Tool descriptions truncated to 200 chars. MCP tools are registered WITHOUT `execute` functions — the AI SDK routes model tool_calls into `result.toolCalls`, and the manual dispatcher in `tool-execution.ts` gates every MCP call through the permission + loop-guard machinery.
+
+Other details: OAuth browser flow for HTTP servers (`oauth/`), env safety gate rejecting dangerous expansions in stdio configs (`env-safety.ts`), `/mcp refresh` for hot reload, `/mcp auth <name>` for fresh OAuth round-trip.
+
+### Hooks
+
+10 lifecycle events: `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `PreCompact`, `PostCompact`, `SubagentStart`, `SubagentStop`, `TurnComplete`, `SessionEnd`. Three are **decision events** (`UserPromptSubmit`, `PreToolUse`, `PostToolUse`) — hooks can return `allow`, `deny`, or `modify`. `deny` short-circuits remaining hooks.
+
+Hooks execute as shell commands with JSON-on-stdin, JSON-on-stdout protocol. Platform-specific command overrides (`commandDarwin` / `commandLinux` / `commandWindows`). Timeout 5s default, 30s max. Failure policy: `allow` (a broken hook must not wedge the loop). Variable expansion: `${pluginDir}`, `${pluginDataDir}`, `${cwd}`, `${homedir}`, `${env:NAME}`, `${sep}`.
+
+HookBus runs decision events serially (order matters for deny/modify), fire-and-forget events in parallel.
+
+### Plugins
+
+Plugin manifests are byte-compatible with Claude Code's `.claude-plugin/plugin.json` — also accepts `.x-code-plugin/plugin.json` or bare `plugin.json`. Two-pass loader: user-scope installs from `installed_plugins.json`, then project-local plugins under `<cwd>/.x-code/plugins/<name>/`.
+
+Contributions: skills, agents, commands, mcpServers, hooks — all optional, with convention-based fallback directories. Integration pipeline (`integration.ts`) converts contributions into shapes consumed by skill/sub-agent/MCP/hook loaders. Plugin-contributed MCP servers are implicitly trusted (user consented at install).
+
+User config: plugins can declare `userConfig` items (API keys, etc.) prompted at install; sensitive values stored in system keyring. `--no-plugins` skips plugin loading entirely.
+
+### E2E tests
+
+`packages/cli/tests/e2e/` — 24 scenarios numbered 01-24 covering all major features (file tools, shell, multi-turn, sub-agents, plan mode, knowledge injection, web search, permissions, MCP, session resume, etc.). Run via `pnpm test:e2e` with flags: `--filter <substr>`, `--resume` (re-run failures), `--model <id>`, `--keep-tmp`, `--list`.
+
+Each scenario spawns `xc -p` in an isolated tmpdir with its own `X_CODE_HOME`. Assertions use the JSONL session output: `ctx.expect.exitCode(r, 0)`, `ctx.expect.toolCalled(r, 'readFile', ...)`, `ctx.expect.assistantMentions(r, /regex/)`, `ctx.expect.noToolErrors(r)`. State persisted in `.state/last-run.json`.
 
 ## Conventions
 

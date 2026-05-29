@@ -339,6 +339,7 @@ export const PROVIDER_DETECTION_ORDER = [
   { envKey: 'XAI_API_KEY', defaultModel: 'xai:grok-3' },
   { envKey: 'ZHIPU_API_KEY', defaultModel: 'zhipu:glm-4-plus' },
   { envKey: 'MOONSHOT_API_KEY', defaultModel: 'moonshotai:kimi-k2.5' },
+  { envKey: 'XF_API_KEY', defaultModel: 'xunfei:astron-code-latest' },
 ] as const
 
 // ─── Curated model catalog per provider (for interactive /model picker) ───
@@ -409,6 +410,7 @@ export const PROVIDER_MODELS: Record<string, readonly ProviderModel[]> = {
   ],
   zhipu: [{ id: 'zhipu:glm-4-plus', label: 'GLM-4 Plus', description: '128k context' }],
   moonshotai: [{ id: 'moonshotai:kimi-k2.5', label: 'Kimi K2.5', description: '131k context' }],
+  xunfei: [{ id: 'xunfei:astron-code-latest', label: 'Astron Code', description: '讯飞星火代码模型, 128k context' }],
 }
 
 // ─── Provider API key URLs ───
@@ -422,6 +424,7 @@ export const PROVIDER_KEY_URLS: Record<string, string> = {
   alibaba: 'https://dashscope.console.aliyun.com/apiKey',
   zhipu: 'https://open.bigmodel.cn/usercenter/apikeys',
   moonshotai: 'https://platform.moonshot.ai/console/api-keys',
+  xunfei: 'https://xinghuo.xfyun.cn/',
 }
 
 // ─── Re-export AI SDK types ───
