@@ -1,4 +1,9 @@
-// @x-code-cli/core — Shared agent loop state
+// @x-code-cli/core — Agent Loop 共享状态容器
+//
+// LoopState 是 agent loop 跨轮、跨提交复用的状态对象。同一 CLI 会话内，
+// UI 层（use-agent.ts）持有 loopStateRef，每次用户提交都把上次的 state 传回。
+// 多数字段是瞬时元数据（token 计数、loop-guard 窗口），不持久化到磁盘；
+// 跨会话延续依赖 jsonl transcript 的重放。
 import type { ModelMessage } from 'ai'
 
 import type { PermissionMode, TodoItem, TokenUsage } from '../types/index.js'
@@ -6,73 +11,75 @@ import type { PermissionMode, TodoItem, TokenUsage } from '../types/index.js'
 export interface LoopState {
   messages: ModelMessage[]
   tokenUsage: TokenUsage
-  /** Real input-token count from the most recent API response, used to trigger compression. */
+  /** 最近一次 API 响应的真实 input token 数。
+   *  用于驱动主动压缩（proactive compression）：checkAndCompressContext
+   *  每轮流前拿这个值和模型上下文阈值比较，超过就触发压缩。
+   *  reactive 压缩后会重置为 0，让下一轮重新累积。 */
   lastInputTokens: number
   sessionId: string
   startedAt: string
   filesModified: Set<string>
-  /** Rolling record of recently executed tool calls, keyed by a hash of the
-   *  tool name + stable-stringified input. Used by the doom-loop guard to
-   *  detect when the model is looping on the same failing call. */
+  /** 最近执行的工具调用滚动记录，以「工具名 + 稳定序列化输入」的哈希为键。
+   *  doom-loop guard（循环保护）用它检测模型是否在反复调用同一个失败的工具。
+   *  哈希只比较工具名 + 输入参数，不比较 toolCallId——同一参数的不同调用
+   *  在循环保护看来是"重复"。详见 loop-guard.ts。 */
   recentToolCalls: Array<{ toolName: string; hash: string }>
-  /** Cached system prompt text — rebuilt once per session so the prefix
-   *  stays byte-stable across turns, enabling automatic prefix-caching on
-   *  OpenAI-compatible providers (DeepSeek, Moonshot, Alibaba, …).
-   *  Invalidated (set to null) on `permissionMode` change so the next turn
-   *  rebuilds it with / without the plan-mode overlay. */
+  /** 缓存的系统提示词文本——整个会话只构建一次，保证前缀字节级稳定。
+   *
+   *  字节级稳定是 OpenAI 兼容供应商（DeepSeek / Moonshot / Alibaba / 智谱 / xAI）
+   *  自动前缀缓存的前提：前缀在请求之间只要变了一个字节，缓存全部失效。
+   *  所以不能在系统提示词里拼"当前时间"、"本轮 token 数"等每轮不同的信息。
+   *
+   *  唯一的刷新触发点是 permissionMode 切换：plan-tools.ts 在进入/退出
+   *  plan mode 时把它置 null，下一轮 runTurn 会重建带/不带 plan-mode 叠加层
+   *  的系统提示词。非切换情况下永远复用同一份字符串。 */
   systemPromptCache: string | null
-  /** Current approval mode — flips between 'default' and 'plan' via
-   *  the /plan slash command (user) or the enterPlanMode/exitPlanMode
-   *  tools (model). Read by tool-execution to decide which system
-   *  prompt overlay applies and which tools are advertised. */
+  /** 当前权限模式——通过 /plan 斜杠命令（用户）或 enterPlanMode/exitPlanMode 工具（模型）切换。
+   *  tool-execution 根据它决定是否应用 plan-mode 叠加层、哪些工具可见。
+   *  不持久化到磁盘——下次启动按 --plan 或用户配置重置。 */
   permissionMode: PermissionMode
-  /** Path to the plan file when in plan mode (`.x-code/plans/{sessionId}.md`),
-   *  null otherwise. Created lazily the first time the model calls
-   *  `enterPlanMode` and re-used for the remainder of that plan-mode
-   *  session. Cleared on exit. */
+  /** plan mode 下的 plan 文件路径（`.x-code/plans/{sessionId}.md`），非 plan mode 时为 null。
+   *  惰性创建——模型第一次调用 enterPlanMode 时才生成，之后同一 plan-mode 会话内复用。
+   *  退出 plan mode 时清空。 */
   currentPlanPath: string | null
-  /** Lowercase-hyphen slug derived from the user's first message, used
-   *  to give session-usage files a human-skimmable name (mirrors how
-   *  plan files are named). Empty string when the first message had no
-   *  ASCII content (e.g. CJK-only) — session file then falls back to
-   *  pure timestamp. Set ONCE on the first agentLoop turn and never
-   *  changed; renaming mid-session would orphan the previous turn's
-   *  on-disk usage file. */
+  /** 从用户首条消息派生的小写连字符短标识，用于给会话文件起人类可读的名称。
+   *  纯英文输入走本地 slugify（0 次 LLM 调用）；中日韩 / emoji / 太短的输入
+   *  会发一次孤立的 generateText 拿 2-4 个英文词。
+   *
+   *  只设一次，永不更新——中途改了会让本会话的 jsonl / plan 文件名错位，
+   *  留下孤儿文件。首次消息无 ASCII 内容时为空串，文件名退回纯时间戳。 */
   taskSlug: string
-  /** Current checklist maintained by the model via the `todoWrite`
-   *  tool. Full-replacement semantics — every todoWrite call rewrites
-   *  this array. In-memory only, never persisted. Auto-cleared back
-   *  to [] when the model submits a list with all items completed.
-   *  Cleared on `/clear` and `/resume` (the new LoopState starts
-   *  fresh with []); preserved across `/compact` so a multi-step
-   *  task survives history summarisation. */
+  /** 模型通过 todoWrite 工具维护的待办清单。
+   *  全量替换语义——每次 todoWrite 调用重写整个数组，不做增量合并。
+   *  纯内存态，不持久化到磁盘。所有项都完成时自动清空为 []。
+   *  /clear 和 /resume 会重建 LoopState（清空为 []）；
+   *  /compact 保留——让多步骤任务在历史总结后仍能看到进度。 */
   todos: TodoItem[]
-  /** Number of messages already persisted to the session jsonl file.
-   *  The agent loop calls `flushPendingMessages` at turn boundaries,
-   *  which appends `state.messages.slice(persistedMessageCount)` and
-   *  bumps the counter. Reset to `state.messages.length` after any
-   *  compaction (light or deep) — those rewritten messages get
-   *  re-flushed after a `compact-boundary` line so the loader's
-   *  "everything-after-last-boundary wins" rule reconstructs the same
-   *  in-memory state on resume. See `agent/session-store.ts`. */
+  /** 已持久化到会话 jsonl 文件的消息数量（游标）。
+   *  agent loop 在轮次边界调 flushPendingMessages，用
+   *  state.messages.slice(persistedMessageCount) 做增量追加，然后推高游标。
+   *
+   *  压缩（轻量或深度）会原地改写 messages 数组，此时游标重置为
+   *  state.messages.length——改写后的消息通过 compact-boundary 行重新刷盘，
+   *  恢复时加载器按"最后一个 boundary 之后的内容为准"的规则重建内存状态。
+   *  详见 agent/session-store.ts。 */
   persistedMessageCount: number
 
-  // ── Sub-agent support (set once in agentLoop, read by tool-execution) ──
+  // ── 子 agent 支持（agentLoop 中设置一次，tool-execution 读取）──
 
-  /** Cached knowledge context for sub-agent system prompts. Set once in
-   *  agentLoop after buildKnowledgeContext resolves; transparent to
-   *  sub-agent loops (they don't call buildKnowledgeContext themselves). */
+  /** 缓存的知识上下文，用于子 agent 的系统提示词。
+   *  在 agentLoop 中 buildKnowledgeContext 解析后设置一次；
+   *  子 agent 循环直接读取，不再单独调用 buildKnowledgeContext。 */
   knowledgeContext?: string
-  /** Whether cwd is a git repo. Cached for sub-agent system prompts. */
+  /** 当前工作目录是否为 git 仓库。一次性探测后缓存，用于子 agent 系统提示词。 */
   isGitRepo?: boolean
 }
 
-/** Generate a human-skimmable session id: `YYYYMMDD-HHMMSS-mmm` (local
- *  time, milliseconds tail for uniqueness across rapid successive
- *  starts). Replaces the old `Date.now().toString(36)` (`mohbm95d`)
- *  which was unreadable in `ls .x-code/sessions/` — the timestamp shape
- *  matches plan-file naming so the two directory listings sort and
- *  scan the same way. */
+/** 生成人类可读的会话 ID：`YYYYMMDD-HHMMSS-mmm`（本地时间，毫秒尾部保证唯一）。
+ *
+ *  取代了旧的 `Date.now().toString(36)`（如 `mohbm95d`），那种格式在
+ *  `ls .x-code/sessions/` 里完全不可读。时间戳格式与 plan 文件命名一致，
+ *  两个目录的文件列表排序和扫描方式统一。 */
 function generateSessionId(now: Date = new Date()): string {
   const pad = (n: number, w = 2) => String(n).padStart(w, '0')
   return (
@@ -100,10 +107,8 @@ export function createLoopState(initialMode: PermissionMode = 'default'): LoopSt
     recentToolCalls: [],
     systemPromptCache: null,
     permissionMode: initialMode,
-    // Plan path is derived LAZILY from the user's task text once a
-    // message lands — done in agentLoop / enterPlanMode handler. We
-    // can't slugify here because the user's intent isn't visible at
-    // session-construction time.
+    // plan 路径在用户首条消息到达后才惰性派生（在 agentLoop / enterPlanMode 中完成）。
+    // 此处无法 slugify——用户的意图在构造 LoopState 时还不可见。
     currentPlanPath: null,
     taskSlug: '',
     todos: [],

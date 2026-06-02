@@ -1,22 +1,17 @@
-// @x-code-cli/core — Truncate tool-result parts inside ModelMessage arrays
+// @x-code-cli/core — 工具结果截断 + 孤儿 tool_call/tool_result 修复
 //
-// AI SDK auto-executed tools (readFile / grep / glob / listDir / webFetch /
-// webSearch) return their results inside `response.messages` as tool-result
-// parts. The manual tool path in `tool-execution.ts` runs every output
-// through `truncateToolResult`, but auto-executed results bypass that path
-// and land in `state.messages` at full size. This module walks the messages
-// produced by a completed stream and applies the same per-tool truncation
-// policy in-place before they persist into the conversation state.
+// AI SDK 自动执行的工具（readFile / grep / glob / listDir / webFetch / webSearch）
+// 的结果通过 `response.messages` 中的 tool-result parts 返回。手动执行路径
+// （tool-execution.ts）会跑 `truncateToolResult`，但自动执行的结果绕过了那条路径，
+// 以原始大小进入 `state.messages`。本模块在流完成后遍历响应消息，在持久化前
+// 原地应用相同的按工具截断策略。
 //
-// Policy is per-tool:
-//   - shell / edit / writeFile: manual path already truncated
-//   - readFile: head-tail (preserve file start + file end)
-//   - grep / glob / listDir: head-only (lexical order is meaningful; the tail
-//     carries no additional signal once the head is representative)
-//   - webFetch: head-tail (pages often have navigation cruft at top + bottom,
-//     but the meaningful content is usually the middle. head-tail still beats
-//     head-only because it preserves the final anchors)
-//   - default: head-tail
+// 按工具的截断策略：
+//   - shell / edit / writeFile：手动路径已经截断过
+//   - readFile：head-tail（保留文件头 + 文件尾）
+//   - grep / glob / listDir：head-only（词法有序，头部代表性足够）
+//   - webFetch：head-tail（页面通常首尾有导航噪音，但尾部保留最终锚点仍有价值）
+//   - 默认：head-tail
 import type { ModelMessage } from 'ai'
 
 import { truncateToolResult } from '../tools/truncate.js'
@@ -32,14 +27,14 @@ const PER_TOOL_POLICY: Record<string, TruncateOptions> = {
   shell: { direction: 'head' },
 }
 
+/** 根据工具名获取截断策略。未注册的工具名使用默认 head-tail 策略。 */
 function policyFor(toolName: string | undefined): TruncateOptions {
   if (!toolName) return { direction: 'head-tail' }
   return PER_TOOL_POLICY[toolName] ?? { direction: 'head-tail' }
 }
 
-/** Narrow typing — AI SDK tool-result parts look roughly like this on the
- *  wire. We only mutate the subset we know about and leave anything else
- *  alone. */
+/** AI SDK tool-result parts 在传输中的大致类型。
+ *  只改写我们已知的子集，其余保持不动。 */
 type ToolResultLike = {
   type: 'tool-result'
   toolName?: string
@@ -50,32 +45,28 @@ type ToolResultLike = {
 }
 
 /**
- * Walk `messages` and reconcile tool_call ↔ tool_result pairing in BOTH
- * directions. Providers strictly require:
- *   - every assistant tool_call to have a paired tool_result
- *   - every tool_result to be preceded by an assistant tool_call with
- *     the matching toolCallId
- * Either kind of orphan will poison the next API request with a
- * "tool must be a response to a preceding message with tool_calls"
- * (or the converse) error.
+ * 遍历 messages 并双向修复 tool_call ↔ tool_result 的配对关系。
  *
- * How the orphans arise:
- *   - Forward (tool_call without result): models occasionally emit
- *     malformed tool input (e.g. todoWrite with required fields
- *     missing). The SDK validates, fails, emits a tool-error event,
- *     and in some cases doesn't push a paired tool-result into
- *     response.messages. We synthesise an error result.
- *   - Reverse (tool_result without preceding tool_call): when the SDK
- *     emits `tool-error` mid-stream because the model's tool input
- *     failed validation, the SDK may exclude the tool_call from
- *     response.messages — but our `processToolCalls` still drains the
- *     `result.toolCalls` promise and runs the tool, pushing a
- *     tool_result into state.messages. We drop that orphan.
+ * 供应商严格要求：
+ *   - 每个 assistant tool_call 都必须有配对的 tool_result
+ *   - 每个 tool_result 之前必须有包含相同 toolCallId 的 assistant tool_call
+ * 任一方向的孤儿都会导致下一次 API 请求 400："tool must be a response to
+ * a preceding message with tool_calls"（或反向错误）。
  *
- * Mutates `messages` in place. Idempotent (running twice is a no-op).
+ * 孤儿的产生方式：
+ *   - 正向（tool_call 无 tool_result）：模型偶尔输出格式错误的 tool input
+ *     （如 todoWrite 缺少必填字段），SDK 验证失败后发出 tool-error 事件，
+ *     某些情况下不推送配对的 tool-result 到 response.messages。
+ *     我们为这些孤儿合成错误结果。
+ *   - 反向（tool_result 无 tool_call）：SDK 因 tool input 验证失败发出
+ *     tool-error 时，可能把 tool_call 从 response.messages 中剔除——但
+ *     processToolCalls 仍会消费 result.toolCalls promise 并执行工具，
+ *     把 tool_result 推入 state.messages。我们删除这些孤儿。
+ *
+ * 原地修改 messages。幂等（跑两次等于什么都没做）。
  */
 export function repairOrphanToolCalls(messages: ModelMessage[]): void {
-  // Collect every tool_call_id that appears in an assistant message.
+  // 第一步：收集所有 assistant 消息中出现的 tool_call_id。
   const expected = new Set<string>()
   const toolNameById = new Map<string, string>()
   for (const msg of messages) {
@@ -89,10 +80,9 @@ export function repairOrphanToolCalls(messages: ModelMessage[]): void {
     }
   }
 
-  // Drop tool-result parts whose toolCallId never appeared in an
-  // assistant tool_call (reverse-orphan). When all parts of a tool
-  // message are orphans, drop the whole message; when only some are,
-  // filter the parts in place.
+  // 删除 tool_result 中 toolCallId 从未出现在 assistant tool_call 中的部分（反向孤儿）。
+  // 如果 tool 消息的所有 parts 都是孤儿，删除整条消息；
+  // 如果只有部分是孤儿，就地过滤掉这些 parts。
   for (let i = messages.length - 1; i >= 0; i--) {
     const msg = messages[i]
     if (!msg || msg.role !== 'tool') continue
@@ -104,16 +94,12 @@ export function repairOrphanToolCalls(messages: ModelMessage[]): void {
       return expected.has(part.toolCallId)
     })
     if (kept.length === 0) {
-      // Splicing the whole tool message can leave assistant→assistant
-      // adjacent (the common shape is assistant tool_calls → tool
-      // results → assistant continuation). Anthropic strictly requires
-      // user/assistant alternation, and although the @ai-sdk/anthropic
-      // converter currently merges consecutive same-role messages for
-      // us, we don't want the sanitizer's correctness to depend on
-      // downstream SDK behavior. When both neighbors are assistant,
-      // replace with a user-text placeholder instead so the boundary
-      // stays. Otherwise (one or both neighbors are user/tool/absent),
-      // dropping is safe.
+      // splice 删除整条 tool 消息可能导致 assistant → assistant 相邻
+      // （常见形态是 assistant tool_calls → tool results → assistant 续写）。
+      // Anthropic 严格要求 user/assistant 交替，虽然 @ai-sdk/anthropic 转换器
+      // 目前会自动合并连续同角色消息，但我们的正确性不应依赖下游 SDK 行为。
+      // 当两侧都是 assistant 时，用 user 文本占位符替代，保持边界。
+      // 否则（一侧或两侧是 user/tool/不存在），直接删除是安全的。
       const prev = messages[i - 1]
       const next = messages[i + 1]
       if (prev?.role === 'assistant' && next?.role === 'assistant') {
@@ -130,15 +116,13 @@ export function repairOrphanToolCalls(messages: ModelMessage[]): void {
         messages.splice(i, 1)
       }
     } else if (kept.length !== parts.length) {
-      // AI SDK's narrow union typings forbid the partial part shape we
-      // operate on at the type level — we already narrowed at runtime
-      // above, so a structural cast is safe here.
+      // AI SDK 的严格联合类型在类型层面禁止我们操作的 partial part 形状——
+      // 但上面已在运行时确认过类型，所以结构化类型断言是安全的。
       ;(msg as { content: unknown }).content = kept
     }
   }
 
-  // Collect every tool_call_id that's already covered by a tool-result
-  // (after the reverse-orphan pass above).
+  // 第三步：收集所有已有 tool_result 配对的 tool_call_id（反向孤儿清除后）。
   const fulfilled = new Set<string>()
   for (const msg of messages) {
     if (msg.role !== 'tool') continue
@@ -150,15 +134,12 @@ export function repairOrphanToolCalls(messages: ModelMessage[]): void {
     }
   }
 
-  // Append synthetic results for forward-orphans, preserving overall
-  // ordering (forward-orphans always go at the end — they never had a
-  // real result, so their position is purely a placeholder for the
-  // next API request). Collect all orphan parts into ONE tool message
-  // rather than pushing one per id: the AI SDK's Anthropic converter
-  // happens to merge consecutive same-role messages today, but the
-  // Google converter does not, and OpenAI-compat splits per tool_call_id
-  // anyway — emitting a single tool ModelMessage is wire-equivalent for
-  // the splitters and strictly safer for the non-merging providers.
+  // 第四步：为正向孤儿追加合成的错误结果，保持整体排序。
+  // 正向孤儿总是放在末尾——它们从来没有真实结果，所以位置纯粹是
+  // 下一次 API 请求的占位符。把所有孤儿 parts 收集到一个 tool 消息中，
+  // 而不是每个 ID 推一条：AI SDK 的 Anthropic 转换器目前会合并连续
+  // 同角色消息，但 Google 转换器不会，OpenAI-compat 会按 tool_call_id
+  // 拆分——输出单条 tool ModelMessage 对拆分器等价，对不合并的供应商更安全。
   const orphanParts: Array<{
     type: 'tool-result'
     toolCallId: string
@@ -180,10 +161,9 @@ export function repairOrphanToolCalls(messages: ModelMessage[]): void {
     })
   }
   if (orphanParts.length > 0) {
-    // Defense in depth: if some other code path already left a trailing
-    // tool message (e.g. processToolCalls pushed real results that we
-    // didn't touch above), merge orphan parts into it rather than
-    // emitting a second adjacent tool ModelMessage.
+    // 纵深防御：如果其他代码路径已经留下了一条尾部 tool 消息
+    //（如 processToolCalls 推送了我们在上面没动的真实结果），
+    // 把孤儿 parts 合并进去，而不是输出第二条相邻的 tool ModelMessage。
     const tail = messages[messages.length - 1]
     if (tail && tail.role === 'tool' && Array.isArray(tail.content)) {
       ;(tail.content as unknown[]).push(...(orphanParts as unknown[]))
@@ -197,9 +177,8 @@ export function repairOrphanToolCalls(messages: ModelMessage[]): void {
 }
 
 /**
- * Walk `messages` in place and truncate any oversized tool-result parts. Only
- * mutates the `output.value` field; the rest of the message structure is
- * preserved exactly as the provider returned it.
+ * 原地遍历 messages 并截断超大的 tool-result parts。
+ * 只改写 output.value 字段，消息结构的其余部分完全保留供应商返回的原样。
  */
 export function truncateToolResultsInMessages(messages: ModelMessage[]): void {
   for (const msg of messages) {
@@ -211,7 +190,7 @@ export function truncateToolResultsInMessages(messages: ModelMessage[]): void {
       const output = part.output
       if (!output) continue
 
-      // Text output: `{ type: 'text', value: string }`
+      // 文本输出：`{ type: 'text', value: string }`
       if (output.type === 'text' && typeof output.value === 'string') {
         const truncated = truncateToolResult(output.value, policyFor(part.toolName))
         if (truncated.length !== output.value.length) {
@@ -220,9 +199,9 @@ export function truncateToolResultsInMessages(messages: ModelMessage[]): void {
         continue
       }
 
-      // Content output: `{ type: 'content', value: Array<{ type: string, text?: string, ... }> }`
-      // Only the text entries are mutable — image-data / file-data / file-url
-      // are binary payloads that the provider-compat layer handles elsewhere.
+      // 内容输出：`{ type: 'content', value: Array<{ type: string, text?: string, ... }> }`
+      // 只有 text 条目是可变的——image-data / file-data / file-url 是二进制载荷，
+      // 由 provider-compat 层在其他地方处理。
       if (output.type === 'content' && Array.isArray(output.value)) {
         const entries = output.value as Array<{ type?: string; text?: string }>
         for (const entry of entries) {
